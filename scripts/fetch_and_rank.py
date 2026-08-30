@@ -1,40 +1,32 @@
 #!/usr/bin/env python3
-"""
-CISA KEV + EPSS Yama Önceliği Panosu — veri toplama ve puanlama script'i.
 
-Akış:
-  1) CISA KEV kataloğunu indir (aktif olarak istismar edilen CVE'ler).
-  2) Her CVE için FIRST.org EPSS skorunu al (istismar olasılığı, 0-1).
-  3) Her kayıt için bir "urgency_score" hesapla:
-       - Süresi geçmiş (overdue) kayıtlar her zaman en üstte.
-       - Kalan gün sayısı azaldıkça puan artar.
-       - EPSS skoru ikincil ağırlık olarak eklenir (yüksek EPSS = daha acil).
-  4) Sonucu site/data.json olarak yaz (statik site bunu okuyup render eder).
-
-Bu script GitHub Actions üzerinde periyodik olarak çalışacak şekilde tasarlandı
-(cti-bulletin projesindeki aynı mimari: fetch -> process -> commit -> Pages).
-"""
 
 import json
 import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+import urllib.parse
+from datetime import datetime, timezone, date
 from pathlib import Path
 
 KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+EUVD_SEARCH_URL = "https://euvdservices.enisa.europa.eu/api/vulnerabilities"
 EPSS_URL = "https://api.first.org/data/v1/epss"
-EPSS_BATCH_SIZE = 100  # FIRST.org API tek istekte çok sayıda CVE kabul eder; ihtiyat payı bırakıyoruz
+EPSS_BATCH_SIZE = 100
+EUVD_PAGE_SIZE = 100
+RECENCY_HALF_LIFE_DAYS = 14   # bu süre geçtikçe güncellik puanı yarıya iner
+RANSOMWARE_BONUS = 150
+EPSS_WEIGHT = 250             # epss_score (0-1) * bu katsayı = ek puan
 OUTPUT_PATH = Path(__file__).resolve().parent.parent / "site" / "data.json"
-USER_AGENT = "cisa-kev-epss-dashboard/1.0 (+github actions bot)"
+USER_AGENT = "cisa-kev-epss-dashboard/1.1 (+github actions bot)"
 
 
 def http_get_json(url: str, retries: int = 3, backoff: float = 2.0):
     last_err = None
     for attempt in range(1, retries + 1):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError) as e:
@@ -44,17 +36,77 @@ def http_get_json(url: str, retries: int = 3, backoff: float = 2.0):
     raise RuntimeError(f"{url} adresinden veri alınamadı: {last_err}")
 
 
+# ---------- Kaynak 1: CISA KEV ----------
+
 def fetch_kev():
     data = http_get_json(KEV_URL)
     vulns = data.get("vulnerabilities", [])
-    print(f"[info] KEV kataloğunda {len(vulns)} kayıt bulundu.")
+    print(f"[info] CISA KEV kataloğunda {len(vulns)} kayıt bulundu.")
     return vulns
 
 
+def parse_iso_date(date_str):
+    try:
+        return datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (ValueError, TypeError):
+        return None
+
+
+# ---------- Kaynak 2: ENISA EUVD ----------
+
+def parse_euvd_date(date_str):
+    """EUVD tarih formatı: 'May 7, 2025, 12:00:00 AM'"""
+    if not date_str:
+        return None
+    try:
+        return datetime.strptime(date_str, "%b %d, %Y, %I:%M:%S %p").date()
+    except ValueError:
+        return None
+
+
+def extract_cve_from_aliases(aliases_str):
+    if not aliases_str:
+        return None
+    for token in aliases_str.split("\n"):
+        token = token.strip()
+        if token.upper().startswith("CVE-"):
+            return token.upper()
+    return None
+
+
+def fetch_euvd_exploited():
+    """/api/vulnerabilities?exploited=true adresinden sayfalayarak tüm aktif istismar edilen kayıtları çeker."""
+    records = []
+    page = 0
+    total = None
+    while True:
+        params = {"exploited": "true", "size": str(EUVD_PAGE_SIZE), "page": str(page)}
+        url = f"{EUVD_SEARCH_URL}?{urllib.parse.urlencode(params)}"
+        try:
+            data = http_get_json(url)
+        except RuntimeError as e:
+            print(f"[warn] EUVD sayfa {page} alınamadı, EUVD çekimi burada durduruluyor: {e}", file=sys.stderr)
+            break
+        items = data.get("items", [])
+        if total is None:
+            total = data.get("total", len(items))
+            print(f"[info] EUVD'de exploited=true olarak toplam {total} kayıt bildiriliyor.")
+        if not items:
+            break
+        records.extend(items)
+        page += 1
+        if page * EUVD_PAGE_SIZE >= total:
+            break
+        time.sleep(0.3)  # API'ye nazik davranalım
+    print(f"[info] EUVD'den {len(records)} kayıt çekildi.")
+    return records
+
+
+# ---------- EPSS (tek kaynak, tutarlılık için) ----------
+
 def fetch_epss_scores(cve_ids):
-    """CVE listesi için EPSS skorlarını toplu şekilde çeker -> {cve_id: {score, percentile}}"""
     scores = {}
-    ids = list(cve_ids)
+    ids = sorted(set(cve_ids))
     for i in range(0, len(ids), EPSS_BATCH_SIZE):
         batch = ids[i:i + EPSS_BATCH_SIZE]
         url = f"{EPSS_URL}?cve={','.join(batch)}"
@@ -72,65 +124,128 @@ def fetch_epss_scores(cve_ids):
     return scores
 
 
-def days_until(date_str):
-    """dueDate string'ini (YYYY-MM-DD) bugüne göre kalan gün sayısına çevirir. Negatifse süresi geçmiş demektir."""
-    try:
-        due = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except (ValueError, TypeError):
+# ---------- Puanlama ----------
+
+def compute_urgency(age_days, epss_score, ransomware_known):
+    """
+    Yüksek puan = daha acil / daha güncel.
+    - Güncellik: age_days arttıkça üstel olarak azalır (yarı ömür: RECENCY_HALF_LIFE_DAYS gün).
+      Bugün eklenen bir kayıt ~1000 puan alır, 14 gün sonra ~500, 90 gün sonra ~12'ye düşer.
+    - EPSS skoru (0-1) ek ağırlık olarak eklenir.
+    - Bilinen ransomware kullanımı sabit bir bonus ekler.
+    """
+    if age_days is None or age_days < 0:
+        recency = 200.0  # tarih bilgisi yoksa/gelecekteyse orta bir değer ver
+    else:
+        recency = 1000.0 * (0.5 ** (age_days / RECENCY_HALF_LIFE_DAYS))
+    epss_bonus = (epss_score or 0.0) * EPSS_WEIGHT
+    ransomware_bonus = RANSOMWARE_BONUS if ransomware_known else 0.0
+    return recency + epss_bonus + ransomware_bonus
+
+
+def days_between(d: date, today: date):
+    if d is None:
         return None
-    today = datetime.now(timezone.utc)
-    return (due - today).days
+    return (today - d).days
 
 
-def compute_urgency(days_remaining, epss_score):
-    """
-    Yüksek skor = daha acil.
-    - Süresi geçmişse: 1000 tabanından başlayıp ne kadar geciktiyse o kadar artan bir puan.
-    - Süresi geçmemişse: kalan güne ters orantılı bir puan (0-500 aralığı).
-    - EPSS skoru (0-1) ek ağırlık olarak eklenir (x100), yani aynı vade grubunda
-      istismar olasılığı daha yüksek olan CVE öne çıkar.
-    """
-    epss_bonus = (epss_score or 0.0) * 100
-    if days_remaining is None:
-        return 50 + epss_bonus  # vade bilgisi yoksa orta öncelik
-    if days_remaining < 0:
-        return 1000 + min(abs(days_remaining), 900) + epss_bonus
-    return max(0, 500 - days_remaining) + epss_bonus
-
+# ---------- Birleştirme ----------
 
 def build_dataset():
+    today = datetime.now(timezone.utc).date()
+
     kev_entries = fetch_kev()
-    cve_ids = [v["cveID"] for v in kev_entries if v.get("cveID")]
-    epss_scores = fetch_epss_scores(cve_ids)
+    euvd_entries = fetch_euvd_exploited()
+
+    kev_cve_ids = {v["cveID"] for v in kev_entries if v.get("cveID")}
+
+    # Tüm CVE'ler için tek kaynaktan (FIRST) tutarlı EPSS skoru çek
+    euvd_cve_ids = {extract_cve_from_aliases(e.get("aliases")) for e in euvd_entries}
+    euvd_cve_ids.discard(None)
+    all_cve_ids = kev_cve_ids | euvd_cve_ids
+    epss_scores = fetch_epss_scores(all_cve_ids)
 
     records = []
+
+    # --- CISA KEV kayıtları ---
     for v in kev_entries:
         cve_id = v.get("cveID")
+        date_added = parse_iso_date(v.get("dateAdded"))
         due_date = v.get("dueDate")
-        remaining = days_until(due_date)
+        age_days = days_between(date_added, today)
+        due_days_remaining = None
+        if due_date:
+            due_d = parse_iso_date(due_date)
+            if due_d:
+                due_days_remaining = (due_d - today).days
         epss = epss_scores.get(cve_id, {})
-        urgency = compute_urgency(remaining, epss.get("score"))
+        ransomware_known = (v.get("knownRansomwareCampaignUse") == "Known")
+        urgency = compute_urgency(age_days, epss.get("score"), ransomware_known)
+
         records.append({
+            "source": "CISA KEV",
             "cve_id": cve_id,
             "vendor": v.get("vendorProject"),
             "product": v.get("product"),
             "vulnerability_name": v.get("vulnerabilityName"),
-            "date_added": v.get("dateAdded"),
-            "due_date": due_date,
-            "days_remaining": remaining,
-            "ransomware_use": v.get("knownRansomwareCampaignUse", "Unknown"),
             "short_description": v.get("shortDescription"),
+            "date_added": v.get("dateAdded"),
+            "age_days": age_days,
+            "due_date": due_date,
+            "due_days_remaining": due_days_remaining,
+            "ransomware_use": v.get("knownRansomwareCampaignUse", "Unknown"),
             "epss_score": epss.get("score"),
             "epss_percentile": epss.get("percentile"),
             "urgency_score": round(urgency, 2),
+        })
+
+    # --- EUVD kayıtları (KEV'de zaten olan CVE'leri tekrar eklemiyoruz) ---
+    for e in euvd_entries:
+        cve_id = extract_cve_from_aliases(e.get("aliases"))
+        if cve_id and cve_id in kev_cve_ids:
+            continue  # zaten CISA KEV'den geldi, mükerrer olmasın
+
+        ref_date_str = e.get("exploitedSince") or e.get("dateUpdated") or e.get("datePublished")
+        ref_date = parse_euvd_date(ref_date_str)
+        age_days = days_between(ref_date, today)
+
+        products = e.get("enisaIdProduct") or []
+        vendors = e.get("enisaIdVendor") or []
+        product_name = products[0]["product"]["name"] if products else None
+        vendor_name = vendors[0]["vendor"]["name"] if vendors else None
+
+        epss = epss_scores.get(cve_id, {}) if cve_id else {}
+        # EUVD'nin kendi epss alanı 0-100 ölçeğinde; FIRST'te bulamazsak yedek olarak onu kullan (100'e bölerek)
+        epss_score = epss.get("score")
+        if epss_score is None and e.get("epss") is not None:
+            epss_score = float(e["epss"]) / 100.0
+
+        urgency = compute_urgency(age_days, epss_score, ransomware_known=False)
+
+        records.append({
+            "source": "EUVD",
+            "cve_id": cve_id or e.get("id"),
+            "vendor": vendor_name,
+            "product": product_name,
+            "vulnerability_name": None,
+            "short_description": e.get("description"),
+            "date_added": ref_date_str,
+            "age_days": age_days,
+            "due_date": None,
+            "due_days_remaining": None,
+            "ransomware_use": "Unknown",
+            "epss_score": epss_score,
+            "epss_percentile": epss.get("percentile"),
+            "urgency_score": round(urgency, 2),
+            "euvd_id": e.get("id"),
         })
 
     records.sort(key=lambda r: r["urgency_score"], reverse=True)
 
     output = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "source_catalog_version": None,
         "count": len(records),
+        "sources": {"cisa_kev": len(kev_cve_ids), "euvd_only": sum(1 for r in records if r["source"] == "EUVD")},
         "records": records,
     }
     return output
