@@ -81,7 +81,7 @@
 <body>
   <header>
     <h1>Yama Önceliği Panosu</h1>
-    <p>CISA Known Exploited Vulnerabilities (KEV) kataloğu + FIRST.org EPSS istismar olasılığı skorları ile günlük olarak yeniden hesaplanan yama önceliği listesi.</p>
+    <p>CISA KEV (ABD) + ENISA EUVD (AB) aktif istismar kayıtları, FIRST.org EPSS skorlarıyla zenginleştirilip <strong>ne kadar yeni tespit edildiğine</strong> göre sıralanır — en güncel ve en yüksek istismar olasılıklı zafiyetler en üstte.</p>
     <div id="meta">Yükleniyor…</div>
   </header>
 
@@ -92,9 +92,14 @@
       <option value="Known">Bilinen ransomware kullanımı</option>
       <option value="Unknown">Bilinmiyor</option>
     </select>
+    <select id="sourceFilter">
+      <option value="">Kaynak: hepsi</option>
+      <option value="CISA KEV">CISA KEV</option>
+      <option value="EUVD">EUVD (ENISA/AB)</option>
+    </select>
     <select id="sortBy">
-      <option value="urgency">Sırala: öncelik puanı</option>
-      <option value="due">Sırala: son tarih</option>
+      <option value="urgency">Sırala: öncelik puanı (güncellik + EPSS)</option>
+      <option value="age">Sırala: en yeni eklenen</option>
       <option value="epss">Sırala: EPSS skoru</option>
     </select>
   </div>
@@ -104,10 +109,12 @@
       <thead>
         <tr>
           <th>Öncelik</th>
+          <th>Kaynak</th>
           <th>CVE</th>
           <th>Tedarikçi / Ürün</th>
           <th>Açıklama</th>
-          <th>Son Tarih</th>
+          <th>Eklenme / İstismar başlangıcı</th>
+          <th>ABD uyum son tarihi</th>
           <th>EPSS</th>
           <th>Ransomware</th>
         </tr>
@@ -120,8 +127,21 @@
 <script>
 let DATA = { records: [] };
 
-function badgeForDueDate(days) {
+function badgeForAge(days) {
   if (days === null || days === undefined) return '<span class="badge ok">—</span>';
+  if (days <= 14) return `<span class="badge overdue">${days} gün önce · yeni</span>`;
+  if (days <= 90) return `<span class="badge soon">${days} gün önce</span>`;
+  return `<span class="badge ok">${days} gün önce</span>`;
+}
+
+function badgeForSource(source) {
+  return source === 'EUVD'
+    ? '<span class="badge soon">EUVD</span>'
+    : '<span class="badge ok">CISA KEV</span>';
+}
+
+function badgeForDueDate(days) {
+  if (days === null || days === undefined) return '<span class="desc">—</span>';
   if (days < 0) return `<span class="badge overdue">${Math.abs(days)} gün gecikti</span>`;
   if (days <= 7) return `<span class="badge soon">${days} gün kaldı</span>`;
   return `<span class="badge ok">${days} gün kaldı</span>`;
@@ -130,17 +150,19 @@ function badgeForDueDate(days) {
 function render() {
   const q = document.getElementById('search').value.trim().toLowerCase();
   const ransomFilter = document.getElementById('ransomwareFilter').value;
+  const sourceFilter = document.getElementById('sourceFilter').value;
   const sortBy = document.getElementById('sortBy').value;
 
   let rows = DATA.records.filter(r => {
     const hay = `${r.cve_id} ${r.vendor} ${r.product}`.toLowerCase();
     const matchesQuery = !q || hay.includes(q);
     const matchesRansom = !ransomFilter || (r.ransomware_use || 'Unknown').startsWith(ransomFilter);
-    return matchesQuery && matchesRansom;
+    const matchesSource = !sourceFilter || r.source === sourceFilter;
+    return matchesQuery && matchesRansom && matchesSource;
   });
 
   rows = rows.slice().sort((a, b) => {
-    if (sortBy === 'due') return (a.days_remaining ?? 9999) - (b.days_remaining ?? 9999);
+    if (sortBy === 'age') return (a.age_days ?? 99999) - (b.age_days ?? 99999);
     if (sortBy === 'epss') return (b.epss_score ?? 0) - (a.epss_score ?? 0);
     return (b.urgency_score ?? 0) - (a.urgency_score ?? 0);
   });
@@ -154,10 +176,12 @@ function render() {
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td class="mono">${r.urgency_score ?? '—'}</td>
-      <td class="cve">${r.cve_id}<br><span class="desc">${r.vulnerability_name || ''}</span></td>
+      <td>${badgeForSource(r.source)}</td>
+      <td class="cve">${r.cve_id || '—'}<br><span class="desc">${r.vulnerability_name || ''}</span></td>
       <td>${r.vendor || '—'}<br><span class="desc">${r.product || ''}</span></td>
       <td class="desc">${r.short_description || ''}</td>
-      <td>${r.due_date || '—'}<br>${badgeForDueDate(r.days_remaining)}</td>
+      <td>${r.date_added || '—'}<br>${badgeForAge(r.age_days)}</td>
+      <td>${r.source === 'CISA KEV' ? (r.due_date || '—') : '<span class="desc">yalnızca ABD KEV için var</span>'}<br>${r.source === 'CISA KEV' ? badgeForDueDate(r.due_days_remaining) : ''}</td>
       <td class="epss">${r.epss_score != null ? (r.epss_score * 100).toFixed(1) + '%' : '—'}</td>
       <td>${r.ransomware_use || 'Unknown'}</td>
     `;
@@ -169,15 +193,16 @@ async function load() {
   try {
     const res = await fetch('data.json', { cache: 'no-store' });
     DATA = await res.json();
+    const s = DATA.sources || {};
     document.getElementById('meta').textContent =
-      `${DATA.count} kayıt · son güncelleme: ${new Date(DATA.generated_at).toLocaleString('tr-TR')}`;
+      `${DATA.count} kayıt (CISA KEV: ${s.cisa_kev ?? '—'}, yalnızca EUVD'de: ${s.euvd_only ?? '—'}) · son güncelleme: ${new Date(DATA.generated_at).toLocaleString('tr-TR')}`;
     render();
   } catch (e) {
     document.getElementById('meta').textContent = 'data.json yüklenemedi — henüz ilk Actions çalışması yapılmamış olabilir.';
   }
 }
 
-['search', 'ransomwareFilter', 'sortBy'].forEach(id =>
+['search', 'ransomwareFilter', 'sourceFilter', 'sortBy'].forEach(id =>
   document.getElementById(id).addEventListener('input', render)
 );
 
