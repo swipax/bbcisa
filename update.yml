@@ -1,0 +1,56 @@
+name: KEV+EPSS verisini güncelle
+
+on:
+  schedule:
+    # Her gün 06:00 UTC'de çalışır — istersen cti-bulletin'deki gibi 2 günde bire çevirebilirsin
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Veriyi çek ve puanla
+        run: python scripts/fetch_and_rank.py
+
+      - name: Değişiklikleri commit'le
+        run: |
+          git config user.name "kev-epss-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add site/data.json
+          git diff --cached --quiet && echo "Değişiklik yok, commit atlanıyor." || git commit -m "chore: KEV+EPSS verisini güncelle ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git push
+
+  deploy-pages:
+    needs: update-data
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: "site"
+      - id: deployment
+        uses: actions/deploy-pages@v4
